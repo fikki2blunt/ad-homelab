@@ -24,3 +24,16 @@ Started: 2nd, November, 2026
 
 &#x20; - Git doesn't track empty folders, so `screenshots`, `scripts` and `tickets` wouldn't appear on GitHub. Fix: added a `.gitkeep` placeholder file to each.
 
+## Phase 1 – Hypervisor
+
+\- Installed VirtualBox \[version] + Extension Pack
+
+\- Set the default machine folder to G:\\HomeLab\\VMs (external drive) to save internal disk space
+
+\- Downloaded the Windows Server 2022 and Windows 11 Enterprise evaluation ISOs to G:\\HomeLab\\ISOs
+
+\- Problems / fixes: none
+
+\- What I learned: VMs can live on an external drive as long as it's NTFS and keeps the same drive letter
+
+
