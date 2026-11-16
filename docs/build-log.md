@@ -6,7 +6,7 @@ A Windows Server 2022 domain (lab.local) with a domain-joined Windows 11 client,
 | --- | --- |
 | Host | Intel i7-8650U (4 cores / 8 threads), 8 GB RAM |
 | VM storage | 500 GB external USB 3 SSD (G:) |
-| Hypervisor | VirtualBox [version] + Extension Pack |
+| Hypervisor | VirtualBox 7.2.22 + Extension Pack |
 | Started | November 2026 |
 
 **Lab network**
@@ -49,7 +49,7 @@ git push -u origin main
 | Step | What I did | Why |
 | --- | --- | --- |
 | 1 | Confirmed virtualisation is enabled (Task Manager → Performance → CPU) | VirtualBox needs Intel VT-x to run 64-bit VMs |
-| 2 | Installed VirtualBox [version] + the Extension Pack | The hypervisor that runs the VMs; the Extension Pack adds USB 3 and other features |
+| 2 | Installed VirtualBox 7.2.22 + the Extension Pack | The hypervisor that runs the VMs; the Extension Pack adds USB 3 and other features |
 | 3 | Set File → Preferences → General → Default Machine Folder to `G:\HomeLab\VMs` | Every new VM is created on the external SSD automatically |
 | 4 | Downloaded the Windows Server 2022 and Windows 11 Enterprise evaluation ISOs to `G:\HomeLab\ISOs` | Free 180-day (Server) and 90-day (Windows 11) trials. I chose regular Enterprise, not LTSC, because it's what office PCs actually run |
 
@@ -364,6 +364,122 @@ The VM not in use is paused with **Close → Save the machine state**, which fre
 - **Fix:** reopened **Terminal (Admin)** and re-ran the three commands. The join succeeded.
 - **Lesson:** read where an error happens. "Access denied" after contacting the DC means permissions, not connectivity.
 
+## Phase 4 – OUs, users and groups
+
+**Goal:** organise lab.local like a small company: departments as OUs, staff as user accounts, and security groups for access. Built partly by hand (to learn the screens) and partly with PowerShell scripts (to learn automation).
+
+Ran on **DC01 only**, apart from the final sign-in test.
+
+### Step 1 – Create the first OU and user by hand (ADUC)
+
+| Action | Where | Why |
+| --- | --- | --- |
+| Created OU **IT** | ADUC → right-click lab.local → New → Organizational Unit | An OU is a folder in AD for organising accounts. Unlike the built-in Users/Computers containers, an OU can have Group Policy linked to it and its management delegated |
+| Left "Protect container from accidental deletion" ticked | New OU dialog | Stops the OU (and everything in it) being deleted by a misclick |
+| Created user **Ada Okafor** (`aokafor`) in IT | Right-click IT → New → User | Learned the user wizard, which is used daily in support for one-off new starters |
+| Ticked "User must change password at next logon" | Password page of the wizard | The admin sets a temporary password; only the user should know their real one |
+| Set Job Title "IT Support Analyst", Department "IT" | User Properties → Organization tab | Matches the scripted users; real companies fill these in for address books and reporting |
+
+### Step 2 – Script 1: `scripts/create-ous.ps1`
+
+```powershell
+& C:\LabScripts\create-ous.ps1
+```
+
+- **What it does:** creates the OUs **Sales** and **Disabled Users** (IT already existed, so it was skipped), protected from accidental deletion.
+- **Why Disabled Users:** leavers' accounts are disabled and moved here rather than deleted straight away, so access can be restored or audited if needed (practised in Phase 5).
+- **Key cmdlets:** `Get-ADOrganizationalUnit` (checks whether it already exists) and `New-ADOrganizationalUnit`.
+
+### Step 3 – Script 2: `scripts/create-users.ps1`
+
+```powershell
+& C:\LabScripts\create-users.ps1
+```
+
+- **What it does:** creates 9 users (2 in IT, 7 in Sales) with first name, surname, display name, job title, department, username and UPN.
+- **Naming standard:** username = first initial + surname, lower case (Sam Carter → `scarter`). UPN = `scarter@lab.local`.
+- **Password handling:** the starting password is typed at a secure prompt (`Read-Host -AsSecureString`) and is never stored in the script. Every account must change it at first sign-in, the same as a real new starter.
+- **Safe to re-run:** it checks `Get-ADUser` first and skips anyone who already exists.
+- **Key cmdlet:** `New-ADUser` with a hashtable of parameters (splatting, `@params`), which keeps long commands readable.
+
+**Users created (10 in total)**
+
+| Name | Username | OU | Title |
+| --- | --- | --- | --- |
+| Ada Okafor (by hand) | aokafor | IT | IT Support Analyst |
+| Tunde Bello | tbello | IT | IT Support Analyst |
+| Grace Mensah | gmensah | IT | IT Support Analyst |
+| Sam Carter | scarter | Sales | Sales Executive |
+| Priya Shah | pshah | Sales | Sales Executive |
+| Leo Martins | lmartins | Sales | Sales Executive |
+| Chloe Evans | cevans | Sales | Sales Executive |
+| Musa Ibrahim | mibrahim | Sales | Sales Executive |
+| Hannah Wright | hwright | Sales | Sales Manager |
+| Daniel Osei | dosei | Sales | Sales Executive |
+
+### Step 4 – Script 3: `scripts/create-groups.ps1`
+
+```powershell
+& C:\LabScripts\create-groups.ps1
+```
+
+| Group | Scope / type | Members | Purpose |
+| --- | --- | --- | --- |
+| IT-Support | Global, Security | Everyone in the IT OU | Access to IT tools and shares |
+| Sales-Team | Global, Security | Everyone in the Sales OU | Access to Sales shares and printers |
+| All-Staff | Global, Security | The IT-Support and Sales-Team **groups** | Company-wide resources |
+
+- **Why groups:** permissions are given to a group once, then people are added or removed. You never set permissions person by person.
+- **Why Global Security:** *Security* groups can grant access (distribution groups are email only). *Global* is the standard scope for grouping people from one domain by department.
+- **Nesting:** All-Staff contains the two department groups, so anything shared with All-Staff automatically includes every member of both.
+- **Key cmdlets:** `New-ADGroup`, `Add-ADGroupMember`.
+
+### Step 5 – Verify
+
+```powershell
+Get-ADOrganizationalUnit -Filter * | Select Name
+Get-ADUser -Filter * -SearchBase "DC=lab,DC=local" -Properties Title, Department |
+  Where-Object { $_.DistinguishedName -like "*OU=*" } |
+  Select Name, SamAccountName, Title, Department
+Get-ADGroupMember "Sales-Team" | Select Name
+Get-ADGroupMember "All-Staff" | Select Name
+```
+
+- OUs: Domain Controllers, IT, Sales, Disabled Users
+- 10 users listed with the correct OU, title and department
+- Sales-Team: 7 users. All-Staff: IT-Support and Sales-Team
+
+### Step 6 – Snapshot
+
+Shut down DC01 and took the snapshot **"Users and groups created"** (VirtualBox → DC01 → Snapshots tab → Take). It's a restore point before Phase 5 and the Group Policy work.
+
+### Step 7 – Test a real domain sign-in on CLIENT01
+
+- Started DC01, waited 2 minutes, then started CLIENT01.
+- Sign-in screen → **Other user** → `LAB\scarter` with the starting password.
+- Windows forced a password change ("The user's password must be changed before signing in"), which proved the "change at next logon" setting works.
+- `whoami` → `lab\scarter`.
+- **Result:** passed. scarter signed in, changed the temporary password, and reached the desktop as a domain user.
+
+### Problems
+
+None. All three scripts ran first time, and the domain sign-in test passed.
+
+### Notes
+
+- **VirtualBox UI:** this version has no three-line menu next to the VM. Snapshots are in the **Snapshots** tab of the right-hand panel.
+- **Resources:** set DC01 back to 2048 MB / 1 vCPU (it had drifted to 2417 MB / 2 vCPU) to keep enough RAM for the host and CLIENT01.
+
+### What I learned
+
+- **OU vs group:** an OU decides *where* an account lives and which Group Policy applies to it. A group decides *what it can access*.
+- **Containers aren't OUs:** the built-in Users and Computers containers can't have Group Policy linked, which is why departments get their own OUs.
+- **`LAB\scarter`:** `LAB` is the domain's short (NetBIOS) name, set with `-DomainNetbiosName "LAB"` when the domain was created. `LAB\scarter` means "the user scarter in the LAB domain". `scarter@lab.local` (the UPN) means the same thing.
+- **Local vs domain accounts:** the account created during Windows setup is a **local** account stored only on CLIENT01 (`CLIENT01\client01`). Domain accounts are stored in AD on DC01 and work on any domain-joined PC. The prefix tells Windows which one to check.
+- **"Other user":** the sign-in screen only lists accounts that have signed in on that PC before, so a first-time domain user has to type their name.
+- **No AD account, no domain sign-in:** that's why creating the account is step one of every new-starter process.
+- **Scripts beat clicking for repeat work:** the same 9 users would take ~20 minutes by hand, and the scripts can be re-run safely and are documented on GitHub.
+
 ---
 
 ## Screenshots
@@ -380,7 +496,12 @@ The VM not in use is paused with **Close → Save the machine state**, which fre
 | 06-client-dns-test.png | nslookup + Test-NetConnection from CLIENT01 |
 | 07-client-joined-domain.png | CLIENT01.lab.local in Settings → About |
 | 08-aduc-computers.png | CLIENT01 in the Computers container |
+| 09-new-user-wizard.png | New Object – User wizard for Ada Okafor |
+| 10-ou-structure.png | ADUC with IT, Sales and Disabled Users |
+| 11-users-powershell.png | Get-ADUser listing all 10 users |
+| 12-sales-team-members.png | Sales-Team → Members tab |
+| 13-domain-user-login.png | CLIENT01 signed in as lab\scarter |
 
 ## Next
 
-Phase 4: OUs (IT, Sales, Disabled Users), 10 users and 3 security groups, created with PowerShell scripts.
+Phase 5: helpdesk tickets – password reset, account lockout and unlock, new starter and leaver – each written up in `tickets/`.
