@@ -482,26 +482,140 @@ None. All three scripts ran first time, and the domain sign-in test passed.
 
 ---
 
+## Phase 5 – Helpdesk tickets
+
+**Goal:** handle the four most common 1st line requests the way a real service desk does, with each one written up as a ticket in `tickets/`.
+
+Done mainly through the **GUI** (ADUC, Group Policy Management) to learn the screens used daily on a service desk. PowerShell was used to investigate the lockout and for the unlock. Scripts for the new starter and leaver are in `scripts/` as the automated alternative.
+
+| Ticket | Type | What happened | Fixed with |
+| --- | --- | --- | --- |
+| [INC-001](../tickets/INC-001-password-reset.md) | Incident | Chloe Evans forgot her password | ADUC → Reset Password, change at next logon |
+| [INC-002](../tickets/INC-002-account-lockout.md) | Incident | Chloe locked herself out mistyping the new password | Found the source (event 4740), then `Unlock-ADAccount` |
+| [REQ-003](../tickets/REQ-003-new-starter.md) | Request | New starter Kemi Adeyemi, Sales Executive | ADUC → Copy existing Sales user, set manager, checked groups |
+| [REQ-004](../tickets/REQ-004-leaver.md) | Request | Leaver Daniel Osei | Recorded groups, removed them, scrambled password, disabled, moved to Disabled Users |
+
+**Ticket layout:** every ticket records the caller, priority, times, identity or approval check, investigation, resolution, verification, a note to the user and lessons, the same fields as ServiceNow or Jira Service Management. `tickets/TEMPLATE.md` is a blank copy.
+
+### Step 1 – Fix the time zone on both VMs
+
+```powershell
+Set-TimeZone -Id "GMT Standard Time"
+```
+
+- **Why:** both VMs were still on the installer default (US Pacific), 8 hours behind UK time. Event logs and ticket times have to match, or investigations get confusing.
+
+### Step 2 – INC-001 Password reset (Chloe Evans)
+
+- **Identity check first:** a password reset is a security action. Confirmed the caller (lab simulation: call-back to the number on file, manager confirmation) and never asked for the old password.
+- **Investigated** with `Get-ADUser cevans -Properties Enabled, LockedOut, PasswordExpired ...`: Enabled True, not locked, PasswordExpired True (see What I learned).
+- **Reset** in ADUC → Sales → right-click Chloe Evans → **Reset Password** → temporary password → **User must change password at next logon**. Left "Unlock" unticked because she wasn't locked.
+- **Verified** on CLIENT01: Windows forced a password change, and `whoami` → `lab\cevans`.
+
+### Step 3 – Account lockout policy (GUI)
+
+A new domain never locks accounts (`LockoutThreshold 0`). Set a policy like a real company would:
+
+**Group Policy Management → lab.local → Default Domain Policy → Edit → Computer Configuration → Policies → Windows Settings → Security Settings → Account Policies → Account Lockout Policy**
+
+| Setting | Value |
+| --- | --- |
+| Account lockout threshold | 5 invalid logon attempts |
+| Account lockout duration | 15 minutes |
+| Reset account lockout counter after | 15 minutes |
+
+Checked with `Get-ADDefaultDomainPasswordPolicy`: LockoutThreshold 5, LockoutDuration and LockoutObservationWindow 00:15:00. Ran `gpupdate /force` on CLIENT01.
+
+### Step 4 – INC-002 Account lockout (Chloe Evans)
+
+- Caused the lockout by typing a wrong password for `LAB\cevans` 5 times on CLIENT01: *"The referenced account is currently locked out and may not be logged on to."*
+- **Investigated on DC01:**
+
+```powershell
+Search-ADAccount -LockedOut | Select Name, SamAccountName            # only cevans
+Get-ADUser cevans -Properties LockedOut, BadLogonCount, LastBadPasswordAttempt |
+  Select Name, LockedOut, BadLogonCount, LastBadPasswordAttempt       # True, 5, 02:04:07
+Get-WinEvent -FilterHashtable @{ LogName = 'Security'; Id = 4740 } -MaxEvents 5 |
+  Select TimeCreated, @{ n = 'User'; e = { $_.Properties[0].Value } }, @{ n = 'Source PC'; e = { $_.Properties[1].Value } }
+                                                                      # 02:04:07, cevans, CLIENT01
+```
+
+- **Event 4740** = "a user account was locked out", logged on the DC. It names the **source computer**, so you can tell whether the user is mistyping or something else (a phone, a saved password, a service) is using an old password.
+- **Unlocked** with `Unlock-ADAccount -Identity cevans` and checked `LockedOut : False`. No password reset, because she still knew her password.
+
+### Step 5 – REQ-003 New starter (Kemi Adeyemi)
+
+- ADUC → Sales → right-click **Sam Carter** → **Copy…** → Kemi Adeyemi, `kadeyemi`, temporary password, change at next logon.
+- Set **Manager = Hannah Wright** (Organization tab), added the ticket number to Description, and checked **Member Of** = Sales-Team.
+- **Why check after copying:** Copy gives the new user every group the template user has, including any extra access.
+
+### Step 6 – REQ-004 Leaver (Daniel Osei)
+
+- Screenshotted **Member Of** first (Domain Users, Sales-Team) as the record of his access.
+- Removed **Sales-Team**, set Description `Leaver - disabled 2026-11-18 (REQ-004)`, reset the password to a random value, **Disable Account**, then **Move…** to **Disabled Users**.
+- **Disable, don't delete:** deleting loses the account's SID, files and audit history. The account is kept disabled for a retention period, then deleted.
+
+### Step 7 – Automation (written, not run)
+
+| Script | Does |
+| --- | --- |
+| `scripts/new-starter.ps1` | Creates a user to the naming standard, sets title, department, manager and ticket number, adds the department group. Stops if the username is taken |
+| `scripts/leaver.ps1` | Saves the user's groups to a file, disables, scrambles the password with a cryptographically random value, removes groups, sets the description, moves to Disabled Users |
+
+Both support `-WhatIf` (dry run). Not run in this phase because the GUI was used to learn the process, so they're untested so far.
+
+### Phase 5 problems
+
+**Problem 1 – ADUC wouldn't open straight after booting DC01**
+- **Cause:** the AD services were still starting, which is slower because the VM runs from the external USB drive.
+- **Fix:** waited 2–3 minutes and it opened.
+- **Lesson:** after a DC reboot, give AD time to start before assuming it's broken.
+
+**Problem 2 – First temporary password rejected**
+- **Cause:** a 4-character password. The Default Domain Policy needs at least 7 characters plus complexity, and that applies to passwords set by admins too.
+- **Fix:** used a longer password that met the rules.
+- **Lesson:** `Get-ADDefaultDomainPasswordPolicy` shows the rules. Users hitting this on their forced change is a common helpdesk call.
+
+**Problem 3 – VMs on the wrong time zone**
+- **Symptom:** DC01 showed 17/11 5:01 PM when UK time was about 01:00 on 18/11.
+- **Fix:** `Set-TimeZone -Id "GMT Standard Time"` on both VMs. Event 4740 then matched the ticket times exactly.
+- **Lesson:** Kerberos uses UTC, so sign-ins still worked, but wrong local time makes logs misleading during an investigation.
+
+### What I learned
+
+- **Lockout ≠ forgotten password:** unlock only when the user still knows the password. A reset makes them choose a new one for no reason.
+- **PasswordExpired = True** on a user who must change their password at next logon: AD clears the password's last-set date, so it reports it as expired. It doesn't mean the password reached its maximum age.
+- **Where lockout lives:** domain password and lockout rules are set in the Default Domain Policy. A policy linked to an OU won't change them for domain accounts.
+- **Always find the source of a lockout** (event 4740 → Caller Computer Name). Many accounts locking at once from one place can mean a password-guessing attack, so escalate to security.
+- **Identity and approval come first:** resets and unlocks need the caller verified; new starters and leavers need an approved request from the manager or HR.
+- **GUI vs PowerShell:** the GUI is quicker for one-off tickets and shows where settings live. Scripts are better for repeat or bulk work and leave a record.
+
+---
+
 ## Screenshots
 
 | File | Shows |
 | --- | --- |
-| 00-external-drive-ntfs.png | External drive formatted NTFS |
-| 01-virtualbox-machine-folder.png | Default machine folder on G: |
-| 02-dc01-vm-settings.png | DC01 hardware and network adapters |
-| 03-dc01-ip-config.png | ipconfig /all – 10.0.0.1 |
-| 04-ad-ds-installed.png | Server Manager with AD DS and DNS |
-| 05-aduc-lab-local.png | Active Directory Users and Computers – lab.local |
-| 05b-dcdiag-passed.png | dcdiag results |
-| 06-client-dns-test.png | nslookup + Test-NetConnection from CLIENT01 |
-| 07-client-joined-domain.png | CLIENT01.lab.local in Settings → About |
-| 08-aduc-computers.png | CLIENT01 in the Computers container |
-| 09-new-user-wizard.png | New Object – User wizard for Ada Okafor |
-| 10-ou-structure.png | ADUC with IT, Sales and Disabled Users |
-| 11-users-powershell.png | Get-ADUser listing all 10 users |
-| 12-sales-team-members.png | Sales-Team → Members tab |
-| 13-domain-user-login.png | CLIENT01 signed in as lab\scarter |
+| [virtual machine setup.png](../screenshots/virtual%20machine%20setup.png) | VirtualBox VM setup |
+| [vm1 windows server 2022 summary.png](../screenshots/vm1%20windows%20server%202022%20summary.png) | DC01 VM summary |
+| [vm 1 full details.png](../screenshots/vm%201%20full%20details.png) | DC01 hardware and network adapters |
+| [DC-01 IP config.png](../screenshots/DC-01%20IP%20config.png) | DC01 static IP 10.0.0.1 |
+| [client01 test connection with dco01.png](../screenshots/client01%20test%20connection%20with%20dco01.png) | nslookup + Test-NetConnection from CLIENT01 |
+| [aduc computers.png](../screenshots/aduc%20computers.png) | CLIENT01 in the Computers container |
+| [new organisational user.png](../screenshots/new%20organisational%20user.png) | New user wizard for Ada Okafor |
+| [ou-structure.png](../screenshots/ou-structure.png) | ADUC with IT, Sales and Disabled Users |
+| [users-in -powershell.png](../screenshots/users-in%20-powershell.png) | Get-ADUser listing all 10 users |
+| [sales team members.png](../screenshots/sales%20team%20members.png) | Sales-Team members |
+| [domain user login.png](../screenshots/domain%20user%20login.png) | CLIENT01 signed in as lab\scarter |
+| [incident001-reset password.png](../screenshots/incident001-reset%20password.png) | INC-001 – Reset Password in ADUC |
+| [incident001- forced change upon login.png](../screenshots/incident001-%20forced%20change%20upon%20login.png) | INC-001 – forced password change on CLIENT01 |
+| [account lockout policy - group policy management.png](../screenshots/account%20lockout%20policy%20-%20group%20policy%20management.png) | Account Lockout Policy in the Default Domain Policy |
+| [dc01 default policy.png](../screenshots/dc01%20default%20policy.png) | Password policy before (threshold 0) and after (5) |
+| [incident002 locked message.png](../screenshots/incident002%20locked%20message.png) | INC-002 – "account is locked out" on CLIENT01 |
+| [incident002- event 4740.png](../screenshots/incident002-%20event%204740.png) | INC-002 – event 4740 showing source CLIENT01 |
+| [inciden002 unlocked.png](../screenshots/inciden002%20unlocked.png) | INC-002 – LockedOut False after unlock |
+| [req004- daniel osei member of.png](../screenshots/req004-%20daniel%20osei%20member%20of.png) | REQ-004 – Daniel's groups before removal |
 
 ## Next
 
-Phase 5: helpdesk tickets – password reset, account lockout and unlock, new starter and leaver – each written up in `tickets/`.
+Phase 6: Group Policy – create and link GPOs to the IT and Sales OUs (e.g. a desktop wallpaper, mapped drive, and a USB storage restriction), then verify on CLIENT01 with `gpresult /r`.
